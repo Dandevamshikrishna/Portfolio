@@ -358,7 +358,7 @@
                
                 <h3>About This Page</h3>
                 <br><p style="text-align: center;">This website was coded in HTML, CSS, and Javascript <br><br> &#169; Copyright @2023 All rigths reserved | this template is made by myself</p>
-            
+            <p id="viewCount"></p>
             <br>
             </div>
             <div >
@@ -379,7 +379,24 @@
                 
             </div>
         </footer> -->
+    <script>
+        // Check if the view count exists in local storage
+        if (localStorage.getItem('viewCount')) {
+            // If it exists, increment the count by 1
+            var viewCount = parseInt(localStorage.getItem('viewCount'));
+            viewCount++;
+            localStorage.setItem('viewCount', viewCount);
+        } else {
+            // If it doesn't exist, initialize it to 1
+            localStorage.setItem('viewCount', 1);
+        }
 
+        // Display the view count
+        window.onload = function() {
+            var count = localStorage.getItem('viewCount');
+            document.getElementById('viewCount').innerHTML = "ViewCount: " + count;
+        };
+    </script>
 
         <!--===== SCROLL REVEAL =====-->
         <script src="https://unpkg.com/scrollreveal"></script>
