@@ -43,23 +43,26 @@
 <!--             ViewCount -->
 <div class="box" id="animatedBox">
     <div>
-      <p id="viewCount">Vistors: 0</p>
+      <p id="viewCount1">Vistors: 0</p>
     </div>
     <script>
-      // Check if the view count exists in localStorage
-      if (localStorage.getItem('viewCount')) {
-          var viewCount = parseInt(localStorage.getItem('viewCount'));
-      } else {
-          viewCount = 1;
-      }
-      window.onload = function() {
-          document.getElementById('viewCount').innerHTML = "&nbsp;&nbsp;<br>Visitors: " + viewCount;
-      };
-      window.onunload = function() {
-          viewCount++;
-          localStorage.setItem('viewCount', viewCount);
-      };
-  </script>
+          // Check if the view count exists in local storage
+          if (localStorage.getItem('viewCount1')) {
+              // If it exists, increment the count by 1
+              var viewCount = parseInt(localStorage.getItem('viewCount1'));
+              viewCount++;
+              localStorage.setItem('viewCount1', viewCount);
+          } else {
+              // If it doesn't exist, initialize it to 1
+              localStorage.setItem('viewCount1', 1);
+          }
+  
+          // Display the view count
+          window.onload = function() {
+              var count = localStorage.getItem('viewCount1');
+              document.getElementById('viewCount1').innerHTML = "ViewCount : " + count;
+          };
+      </script>
  <style>
   .box {
     width: 100px;
