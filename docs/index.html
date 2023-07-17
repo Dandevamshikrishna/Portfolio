@@ -39,7 +39,54 @@
         </header>
             
         <main class="l-main">
-  
+
+<!--             ViewCount -->
+<div class="box" id="animatedBox">
+    <div>
+      <p id="viewCount">Vistors: 0</p>
+    </div>
+    <script>
+      // Check if the view count exists in localStorage
+      if (localStorage.getItem('viewCount')) {
+          var viewCount = parseInt(localStorage.getItem('viewCount'));
+      } else {
+          viewCount = 1;
+      }
+      window.onload = function() {
+          document.getElementById('viewCount').innerHTML = "&nbsp;&nbsp;<br>Visitors: " + viewCount;
+      };
+      window.onunload = function() {
+          viewCount++;
+          localStorage.setItem('viewCount', viewCount);
+      };
+  </script>
+ <style>
+  .box {
+    width: 100px;
+    background-image: linear-gradient(0.25deg, rgba(178, 228, 192, 0.7), rgb(255, 255, 255),rgb(38, 248, 248));
+    border-radius: 6px;
+    height: 50px;
+    background-color: #20dbd1;
+    position: fixed;
+    right: -70px;
+    top: 50%;
+    transform: translateY(-50%);
+  opacity:initial;
+  transform: rotate(0deg);
+  transition: transform 0.3s ease-in-out;
+  border: 3px solid rgb(255, 253, 253);
+}
+
+body:hover .box {
+  box-shadow: 10px 10px 10px rgba(0, 0, 0, 0.2);
+  transform: rotate(360deg);
+   right: 0;
+}
+
+ </style>
+  </div>
+
+            
                 <!--===== HOME =====-->
                 <section class="home bd-grid" id="home">
                   <div class="home__data">
