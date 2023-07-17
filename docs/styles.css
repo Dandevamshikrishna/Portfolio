@@ -176,12 +176,12 @@ img {
 .section-title::after {
   position: absolute;
   content: '';
-  width: 64px;
+  width: 74px;
   height: 0.18rem;
   left: 0;
   right: 0;
   margin: auto;
-  top: 2rem;
+  top: 110%;
   background-color: var(--first-color);
 }
 
