@@ -201,6 +201,492 @@ main {
 
 
 
+import sys
+import os
+import glob
+import string
+import configparser as cp
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import csv
+import itertools
+from zipfile import ZipFile
+import hashlib
+import logging
+
+import boto3
+from io import BytesIO
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.context import SparkContext
+
+# Initialize Glue context
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+# Define arguments
+args = getResolvedOptions(sys.argv,
+                          ['JOB_NAME',
+                           'INPUT_S3_PATH',
+                           'OUTPUT_S3_PATH',
+                           'ARCHIVE_S3_PATH',
+                           'CONFIG_S3_PATH',
+                           'LOG_S3_PATH',
+                           'DATABASE_NAME',  #For audit table
+                           'TABLE_NAME' #For audit table
+                           ])
+
+JOB_NAME = args['JOB_NAME']
+INPUT_S3_PATH = args['INPUT_S3_PATH']
+OUTPUT_S3_PATH = args['OUTPUT_S3_PATH']
+ARCHIVE_S3_PATH = args['ARCHIVE_S3_PATH']
+CONFIG_S3_PATH = args['CONFIG_S3_PATH']
+LOG_S3_PATH = args['LOG_S3_PATH']
+DATABASE_NAME = args['DATABASE_NAME']
+TABLE_NAME = args['TABLE_NAME']
+
+# Initialize logger
+logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO)
+logger = logging.getLogger()
+
+# Initialize s3 client
+s3_client = boto3.client('s3')
+
+# Configuration
+config = cp.ConfigParser()
+tml_header = 0
+amc_header = 0
+al_header = 0
+ai_header = 0
+tty_header = 0
+a_header = 0
+root_dir = '/tmp/'
+
+def download_config_files(config_s3_path, s3_client):
+    config_dir = os.path.join(root_dir, 'config')
+    os.makedirs(config_dir, exist_ok=True)
+
+    bucket_name = get_bucket_name(config_s3_path)
+    prefix = get_prefix(config_s3_path)
+
+    response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+    for obj in response.get('Contents', []):
+        s3_file_key = obj['Key']
+        local_file_path = os.path.join(config_dir, os.path.basename(s3_file_key))
+        try:
+            s3_client.download_file(bucket_name, s3_file_key, local_file_path)
+            logger.info(f"Downloaded {s3_file_key} to {local_file_path}")
+        except Exception as e:
+            logger.error(f"Error downloading {s3_file_key}: {e}")
+            raise
+
+def get_bucket_name(s3_path):
+    return s3_path.replace("s3://", "").split('/')[0]
+
+def get_prefix(s3_path):
+    return "/".join(s3_path.replace("s3://", "").split('/')[1:])
+
+def add_columns(col_num):
+    alpha_list = list(string.ascii_uppercase)
+    if col_num <= 25:
+        return alpha_list[col_num]
+    else:
+        return alpha_list[0] + alpha_list[col_num - 26]
+
+def convertPartDReportToDF(filetoloaddf, xlfilename, reporttimeperiod):
+    logger.info("processing AA file {0}".format(xlfilename))
+    partddf = pd.read_excel(filetoloaddf, keep_default_na=False)
+    partddf.index = np.arange(2, len(partddf) + 2)
+    partddf.columns = list(map(add_columns, [col for col in range(len(partddf.columns))]))
+
+    mapconfigfile = os.path.join(root_dir, 'config', 'mapping.ini')
+    config.read(mapconfigfile)
+
+    if xlfilename.__contains__('_d_'):
+        logger.info("service_catagory for _d_{0}".format(xlfilename))
+        service_category = "Part D Prospective Beneficiary Service"
+    else:
+        service_category = "Part C Prospective Beneficiary Service"
+        logger.info("service_catagory for _c_{0}".format(xlfilename))
+
+    file_details = [xlfilename, reporttimeperiod, service_category, xlfilename[:-5][-5:]]
+    index = partddf.loc[partddf['A'] == 'Prospective Calls - Cumulative (Year-To-Date)'].index
+    number_of_records = 0
+
+    number_of_records_amc = createAccessiblityMonitoringCallsCSV(partddf, file_details, index[0])
+    number_of_records_al = createAccessiblityLanguageCSV(partddf, file_details, index[1])
+    number_of_records_ai = createAccessiblityInterpreterCSV(partddf, file_details, index[2])
+    number_of_records_atty = createAccessiblityTTYCSV(partddf, file_details, index[3])
+    number_of_records_a = createAccuracyCSV(partddf, file_details, index[4])
+
+    number_of_records += number_of_records_amc + number_of_records_al + number_of_records_ai + number_of_records_atty + number_of_records_a
+
+    return number_of_records
+
+def convertPartCReporttoDF(filetoloaddf, xlfilename, reporttimeperiod):
+    partddf = pd.read_excel(filetoloaddf, keep_default_na=False)
+    partddf.index = np.arange(2, len(partddf) + 2)
+    partddf.columns = list(map(add_columns, [col for col in range(len(partddf.columns))]))
+
+    if xlfilename.__contains__('part_c_bene'):
+        logger.info("service_catagory for part_c_bene{0}".format(xlfilename))
+        service_category = "Part C Beneficiary Service"
+    elif xlfilename.__contains__('part_d_bene'):
+        logger.info("service_catagory for part_d_bene{0}".format(xlfilename))
+        service_category = "Part D Beneficiary Service"
+    elif xlfilename.__contains__('part_d_pharm'):
+        logger.info("service_catagory for part_c_pharm{0}".format(xlfilename))
+        service_category = "Part D Pharmacy Support"
+
+    file_details = [xlfilename, reporttimeperiod, service_category, xlfilename[:-5][-5:]]
+    now = datetime.now()
+    mapconfigfile = os.path.join(root_dir, 'config', 'mapping.ini')
+    config.read(mapconfigfile)
+
+    number_of_records = createTimelinessCSV(partddf, file_details)
+
+    return number_of_records
+
+def createAccessiblityMonitoringCallsCSV(dataframe, file_details, index):
+    global amc_header
+    amc = config.get('CONFIG', 'accessiblity_monitoring_calls')
+    options = config.options(amc)
+    header = list(eval(config.get(amc, options[0])))
+    filename = config.get(amc, options[2])
+    if amc_header == 0:
+        createFileHeader(filename, header)
+    amc_header += 1
+    rows = config.get(amc, options[1])
+    rows = list(eval(rows))
+    for cell in rows:
+        cell_ind = rows.index(cell)
+        cell_value = dataframe.loc[index, cell]
+        if isinstance(cell_value, float) or isinstance(cell_value, int) == True:
+            rows[cell_ind] = str(round((cell_value * 100), 2)) + '%'
+        else:
+            rows[cell_ind] = cell_value
+
+    result = createCSVFile(filename, rows, file_details)
+    return result
+
+def createAccessiblityLanguageCSV(dataframe, file_details, index):
+    global al_header
+    al = config.get('CONFIG', 'accessiblity_language')
+    options = config.options(al)
+    header = list(eval(config.get(al, options[0])))
+    filename = config.get(al, options[2])
+    if al_header == 0:
+        createFileHeader(filename, header)
+    al_header += 1
+    rows = config.get(al, options[1])
+    rows = list(eval(rows))
+    rows_to_send = []
+    for row in rows:
+        language_class = []
+        language = []
+        if 'B' in row:
+            language.append('English in US/Spanish in PR')
+            language_class.append('Native')
+        elif 'F' in row:
+            language.append('Spanish in US/English in PR')
+            language_class.append('Non-native')
+        elif 'J' in row:
+            language.append('French')
+            language_class.append('Non-native')
+        elif 'N' in row:
+            language.append('Tagalog')
+            language_class.append('Non-native')
+        elif 'R' in row:
+            language.append('Vietnamese')
+            language_class.append('Non-native')
+        elif 'V' in row:
+            language.append('Mandarin')
+            language_class.append('Non-native')
+        elif 'Z' in row:
+            language.append('Cantonese')
+            language_class.append('Non-native')
+
+        for cell in row:
+            cell_ind = row.index(cell)
+            cell_value = dataframe.loc[index, cell]
+            if isinstance(cell_value, float) or isinstance(cell_value, int) == True:
+                row[cell_ind] = str(round((cell_value * 100), 2)) + '%'
+            else:
+                row[cell_ind] = cell_value
+        row = list(itertools.chain(language_class, language, row))
+        rows_to_send.append(row)
+    result = createCSVFile(filename, rows_to_send, file_details)
+    return result
+
+def createAccessiblityInterpreterCSV(dataframe, file_details, index):
+    global ai_header
+    ai = config.get('CONFIG', 'accessiblity_interpreter')
+    options = config.options(ai)
+    header = list(eval(config.get(ai, options[0])))
+    filename = config.get(ai, options[2])
+    if ai_header == 0:
+        createFileHeader(filename, header)
+    ai_header += 1
+    rows = config.get(ai, options[1])
+    rows = list(eval(rows))
+    for cell in rows:
+        cell_ind = rows.index(cell)
+        cell_value = dataframe.loc[index, cell]
+        if isinstance(cell_value, float) or isinstance(cell_value, int) == True:
+            rows[cell_ind] = str(round((cell_value * 100), 2)) + '%'
+        else:
+            rows[cell_ind] = str(cell_value)
+    result = createCSVFile(filename, rows, file_details)
+    return result
+
+def createAccessiblityTTYCSV(dataframe, file_details, index):
+    global tty_header
+    atty = config.get('CONFIG', 'accessiblity_tty')
+    options = config.options(atty)
+    header = list(eval(config.get(atty, options[0])))
+    filename = config.get(atty, options[2])
+    if tty_header == 0:
+        createFileHeader(filename, header)
+    tty_header += 1
+    rows = config.get(atty, options[1])
+    rows = list(eval(rows))
+    for cell in rows:
+        cell_ind = rows.index(cell)
+        cell_value = dataframe.loc[index, cell]
+        if isinstance(cell_value, float) or isinstance(cell_value, int) == True:
+            rows[cell_ind] = str(round((cell_value * 100), 2)) + '%'
+        else:
+            rows[cell_ind] = str(cell_value)
+    result = createCSVFile(filename, rows, file_details)
+    return result
+
+def createTimelinessCSV(dataframe, file_details):
+    global tml_header
+    tml = config.get('CONFIG', 'timeliness')
+    options = config.options(tml)
+    header = list(eval(config.get(tml, options[0])))
+    rows = config.get(tml, options[1])
+    filename = config.get(tml, options[2])
+    if tml_header == 0:
+        createFileHeader(filename, header)
+    tml_header += 1
+    rows = list(eval(rows))
+    for row in rows:
+        for cell in row:
+            cell_ind = row.index(cell)
+            col, indx = cell[0:1], cell[1:2]
+            cell_value = dataframe.loc[int(indx), col]
+            if isinstance(cell_value, float):
+                row[cell_ind] = str(round(cell_value * 100, 2)) + '%'
+            else:
+                row[cell_ind] = str(cell_value)
+    result = createCSVFile(filename, rows, file_details)
+    return result
+
+def createAccuracyCSV(dataframe, file_details, index):
+    global a_header
+    a = config.get('CONFIG', 'accessiblity_medicare_questions')
+    options = config.options(a)
+    header = list(eval(config.get(a, options[0])))
+    filename = config.get(a, options[2])
+    if a_header == 0:
+        createFileHeader(filename, header)
+    a_header += 1
+    rows = config.get(a, options[1])
+    rows = list(eval(rows))
+    for cell in rows:
+        cell_ind = rows.index(cell)
+        cell_value = dataframe.loc[index, cell]
+        if isinstance(cell_value, float) or isinstance(cell_value, int) == True:
+            rows[cell_ind] = str(cell_value * 100) + '%'
+        else:
+            rows[cell_ind] = str(cell_value)
+    result = createCSVFile(filename, rows, file_details)
+    return result
+
+def createFileHeader(filename, header):
+    output_file_path = os.path.join(root_dir, 'outdata', filename)
+    with open(output_file_path, 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(header)
+    file.close()
+
+def createCSVFile(csv_filename, csv_rows, file_details):
+    output_file_path = os.path.join(root_dir, 'outdata', csv_filename)
+    with open(output_file_path, 'a+', newline='') as file:
+        writer = csv.writer(file)
+        a = np.array(csv_rows)
+        if len(a.shape) == 1:
+            number_of_records = 1
+        else:
+            number_of_records = len(csv_rows)
+        if isinstance(csv_rows[0], str):
+            writer.writerow(file_details + csv_rows)
+        else:
+            for row in csv_rows:
+                writer.writerow(file_details + row)
+    file.close()
+
+    # Upload the file to S3
+    s3_output_path = os.path.join(OUTPUT_S3_PATH, csv_filename)
+    try:
+        s3_client.upload_file(output_file_path, get_bucket_name(s3_output_path), get_prefix(s3_output_path))
+        logger.info(f"Uploaded {csv_filename} to {s3_output_path}")
+    except Exception as e:
+        logger.error(f"Error uploading {csv_filename} to {s3_output_path}: {e}")
+        raise
+
+    return number_of_records
+
+def dupCheck(checksum_value):
+    try:
+        response = s3_client.get_object(Bucket=get_bucket_name(LOG_S3_PATH), Key='checksums.txt')
+        existing_checksums = response['Body'].read().decode('utf-8').splitlines()
+    except s3_client.exceptions.NoSuchKey:
+        existing_checksums = []
+
+    if checksum_value in existing_checksums:
+        return False
+
+    existing_checksums.append(checksum_value)
+
+    checksums_data = '\n'.join(existing_checksums)
+    s3_client.put_object(Bucket=get_bucket_name(LOG_S3_PATH), Key='checksums.txt', Body=checksums_data)
+    return True
+
+def insert_audit_table(filedetail):
+    columns = ['job_name', 'file_name', 'file_size', 'process_name', 'number_of_records', 'checksum_value', 'status', 'details', 'file_modified_date', 'start_time', 'end_time']
+    values = filedetail
+    insert_statement = f"INSERT INTO `{DATABASE_NAME}`.`{TABLE_NAME}` ({', '.join(columns)}) VALUES ('{values[0]}', '{values[1]}', '{values[2]}', '{values[3]}', '{values[4]}', '{values[5]}', '{values[6]}', '{values[7]}', '{values[8]}', '{values[9]}', '{values[10]}')"
+
+    try:
+        glueContext.spark_session.sql(insert_statement)
+        logger.info("Record inserted successfully in audit table")
+    except Exception as e:
+        logger.error(f"Error inserting record in audit table: {e}")
+        raise
+
+def process_zip_files():
+    process_start = datetime.now()
+    logger.info("Process started : {0}".format(process_start))
+    logger.info("Processing Excel to CSV")
+
+    download_config_files(CONFIG_S3_PATH, s3_client)
+
+    # Create local directories
+    os.makedirs(os.path.join(root_dir, 'indata', 'processing_files'), exist_ok=True)
+    os.makedirs(os.path.join(root_dir, 'outdata'), exist_ok=True)
+
+    bucket_name = get_bucket_name(INPUT_S3_PATH)
+    prefix = get_prefix(INPUT_S3_PATH)
+
+    response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+    zip_files = [obj['Key'] for obj in response.get('Contents', []) if obj['Key'].endswith('.zip')]
+
+    for zip_file_key in zip_files:
+        zip_file_name = os.path.basename(zip_file_key)
+        logger.info("processing folder {0}".format(zip_file_name))
+
+        if 'CCMAS' in zip_file_name or 'CCMTS' in zip_file_name:
+            rpt = zip_file_name[:-4][-17:]
+
+            local_zip_path = os.path.join(root_dir, 'indata', zip_file_name)
+            try:
+                s3_client.download_file(bucket_name, zip_file_key, local_zip_path)
+                logger.info(f"Downloaded {zip_file_key} to {local_zip_path}")
+            except Exception as e:
+                logger.error(f"Error downloading {zip_file_key}: {e}")
+                filedetail = (
+                    'Call_Center_Monitoring', str(zip_file_name), '',
+                    'Inbound_Call_Center_Monitoring', '', '',
+                    'FAILURE', repr(e),
+                    '',
+                    process_start.strftime("%Y-%m-%d %H:%M:%S"), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                insert_audit_table(filedetail)
+                continue
+
+            extraction_path = os.path.join(root_dir, 'indata', 'processing_files')
+            try:
+                with ZipFile(local_zip_path, 'r') as zipObj:
+                    zipObj.extractall(extraction_path)
+                    logger.info(f"Extracted {zip_file_name} to {extraction_path}")
+            except Exception as e:
+                logger.error(f"Error extracting {zip_file_name}: {e}")
+                filedetail = (
+                    'Call_Center_Monitoring', str(zip_file_name), os.path.getsize(local_zip_path),
+                    'Inbound_Call_Center_Monitoring', '', '',
+                    'FAILURE', repr(e),
+                    datetime.fromtimestamp(os.path.getmtime(local_zip_path)).strftime("%Y-%m-%d %H:%M:%S"),
+                    process_start.strftime("%Y-%m-%d %H:%M:%S"), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                insert_audit_table(filedetail)
+                continue
+
+            files = glob.glob(os.path.join(extraction_path, '*'))
+            for file in files:
+                start = datetime.now()
+                file_name = os.path.basename(file)
+                logger.info("Processing File:{0}".format(file_name))
+                try:
+                    with open(file, "rb") as f:
+                        checksum_data = f.read()
+                        checksum_value = hashlib.md5(checksum_data).hexdigest()
+                        dup_check_ret = dupCheck(checksum_value)
+
+                        if dup_check_ret == True:
+                            number_of_records = convertPartDReportToDF(file, file_name, rpt)
+
+                            filedetail = (
+                                'Call_Center_Monitoring', str(file_name), os.path.getsize(file),
+                                'Inbound_Call_Center_Monitoring', number_of_records, checksum_value, 'SUCCESS',
+                                'File Processed Successfully',
+                                datetime.fromtimestamp(os.path.getmtime(file)).strftime("%Y-%m-%d %H:%M:%S"),
+                                start.strftime("%Y-%m-%d %H:%M:%S"), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+                            insert_audit_table(filedetail)
+                        else:
+                            logger.info("Checksum already exists. File already processed")
+                            filedetail = (
+                                'Call_Center_Monitoring', str(file_name), os.path.getsize(file),
+                                'Inbound_Call_Center_Monitoring', '', checksum_value, 'SUCCESS', 'File Duplicated',
+                                datetime.fromtimestamp(os.path.getmtime(file)).strftime("%Y-%m-%d %H:%M:%S"),
+                                start.strftime("%Y-%m-%d %H:%M:%S"), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+                            insert_audit_table(filedetail)
+
+                except Exception as e:
+                    logger.error("Error in processing file:{0} {1}".format(file_name, repr(e)))
+                    filedetail = (
+                        'Call_Center_Monitoring', str(file_name), os.path.getsize(file),
+                        'Inbound_Call_Center_Monitoring', '', '',
+                        'FAILURE', repr(e),
+                        datetime.fromtimestamp(os.path.getmtime(file)).strftime("%Y-%m-%d %H:%M:%S"),
+                        start.strftime("%Y-%m-%d %H:%M:%S"), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+                    insert_audit_table(filedetail)
+
+            # Move processed zip file to archive
+            archive_s3_key = os.path.join(get_prefix(ARCHIVE_S3_PATH), zip_file_name)
+            try:
+                s3_client.copy_object(Bucket=get_bucket_name(ARCHIVE_S3_PATH),
+                                      CopySource={'Bucket': bucket_name, 'Key': zip_file_key},
+                                      Key=archive_s3_key)
+                s3_client.delete_object(Bucket=bucket_name, Key=zip_file_key)
+                logger.info(f"Moved {zip_file_key} to {archive_s3_key}")
+            except Exception as e:
+                logger.error(f"Error moving {zip_file_key} to {archive_s3_key}: {e}")
+                raise
+
+    process_end = datetime.now()
+    logger.info("Process ended : {0}".format(process_end))
+    job.commit()
+
+if __name__ == "__main__":
+    job.init(JOB_NAME, args)
+    process_zip_files()
 
 
 
