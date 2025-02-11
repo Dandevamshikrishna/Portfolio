@@ -220,487 +220,6 @@ main {
                     <li class="nav__item"><a href="#" class="nav__link active">About</a></li>
                     <li class="nav__item"><a href="portfolio.html" class="nav__link">Portfolio</a></li>
                     <li class="nav__item"><a href="vamshikrishnadanderesume.pdf" class="nav__link1">Resume</a></li>
-                  import string
-import pandas as pd
-import os
-import configparser as cp
-import numpy as np
-import csv
-from datetime import datetime
-from zipfile import ZipFile
-import time
-import sys
-import itertools
-import shutil
-import logging
-import hashlib
-from load_to_teradata import CSV2TeradataLoad
-import io  # Import the io module
-import zipfile
-import boto3
-
-# Global configuration object (loaded from S3)
-config = None
-s3_client = None  # Global S3 client
-outdata_prefix = None  # Global output prefix
-
-
-def load_config(s3_client, bucket_name, config_prefix_key):
-    """Loads the configuration file from S3."""
-    try:
-        obj = s3_client.get_object(Bucket=bucket_name, Key=config_prefix_key)
-        config_string = obj['Body'].read().decode('utf-8')
-        config_parser = cp.ConfigParser()
-        config_parser.read_string(config_string)
-        logging.info(f"Configuration loaded successfully from s3://{bucket_name}/{config_prefix_key}")
-        return config_parser
-    except Exception as e:
-        logging.error(f"Error loading configuration from S3: {e}")
-        raise  # Re-raise the exception to stop the job
-
-
-def add_columns(col_num):
-    alpha_list = list(string.ascii_uppercase)
-    if col_num <= 25:
-        return alpha_list[col_num]
-    else:
-        return alpha_list[0] + alpha_list[col_num - 26]
-
-
-def convertPartDReportToDF(excel_file_content, xlfilename, reporttimeperiod, bucket_name, config):
-    print("processing AA file {0}".format(xlfilename))
-    partddf = pd.read_excel(excel_file_content, keep_default_na=False)
-    partddf.index = np.arange(2, len(partddf) + 2)
-    partddf.columns = list(map(add_columns, [col for col in range(len(partddf.columns))]))
-
-    if xlfilename.__contains__('_d_'):
-        print("service_catagory for _d_{0}".format(xlfilename))
-        service_category = "Part D Prospective Beneficiary Service"
-    else:
-        service_category = "Part C Prospective Beneficiary Service"
-        print("service_catagory for _c_{0}".format(xlfilename))
-
-    file_details = [xlfilename, reporttimeperiod, service_category, xlfilename[:-5][-5:]]
-    index = partddf.loc[partddf['A'] == 'Prospective Calls - Cumulative (Year-To-Date)'].index
-    number_of_records = 0
-
-    number_of_records_amc = createAccessiblityMonitoringCallsCSV(partddf, file_details, index[0], config,
-                                                                 bucket_name, xlfilename)
-
-    number_of_records_al = createAccessiblityLanguageCSV(partddf, file_details, index[1], config, bucket_name,
-                                                          xlfilename)
-
-    number_of_records_ai = createAccessiblityInterpreterCSV(partddf, file_details, index[2], config, bucket_name,
-                                                            xlfilename)
-
-    number_of_records_atty = createAccessiblityTTYCSV(partddf, file_details, index[3], config, bucket_name,
-                                                          xlfilename)
-
-    number_of_records_a = createAccuracyCSV(partddf, file_details, index[4], config, bucket_name, xlfilename)
-
-    number_of_records += number_of_records_amc + number_of_records_al + number_of_records_ai + number_of_records_atty + number_of_records_a
-
-    return number_of_records
-
-
-def convertPartCReporttoDF(excel_file_content, xlfilename, reporttimeperiod, bucket_name, config):
-    partddf = pd.read_excel(excel_file_content, keep_default_na=False)
-    partddf.index = np.arange(2, len(partddf) + 2)
-    partddf.columns = list(map(add_columns, [col for col in range(len(partddf.columns))]))
-    if xlfilename.__contains__('part_c_bene'):
-        print("service_catagory for part_c_bene{0}".format(xlfilename))
-        service_category = "Part C Beneficiary Service"
-    elif xlfilename.__contains__('part_d_bene'):
-        print("service_catagory for part_d_bene{0}".format(xlfilename))
-        service_category = "Part D Beneficiary Service"
-    elif xlfilename.__contains__('part_d_pharm'):
-        print("service_catagory for part_c_pharm{0}".format(xlfilename))
-        service_category = "Part D Pharmacy Support"
-    else:
-        service_category = "Unknown"
-
-    file_details = [xlfilename, reporttimeperiod, service_category, xlfilename[:-5][-5:]]
-
-    number_of_records = createTimelinessCSV(partddf, file_details, config, bucket_name, xlfilename)
-
-    return number_of_records
-
-
-def createAccessiblityMonitoringCallsCSV(dataframe, file_details, index, config, bucket_name, xlfilename):
-    amc = config.get('CONFIG', 'accessiblity_monitoring_calls')
-    options = config.options(amc)
-    header = list(eval(config.get(amc, options[0])))
-    filename = config.get(amc, options[2])
-
-    rows = config.get(amc, options[1])
-    rows = list(eval(rows))
-
-    for cell in rows:
-        cell_ind = rows.index(cell)
-        cell_value = dataframe.loc[index, cell]
-        if isinstance(cell_value, float) or isinstance(cell_value, int) == True:
-            rows[cell_ind] = str(round((cell_value * 100), 2)) + '%'
-        else:
-            rows[cell_ind] = cell_value
-
-    createCSVFile(header, filename, rows, file_details, bucket_name, xlfilename)
-    return len(rows)
-
-def createAccessiblityLanguageCSV(dataframe, file_details, index, config, bucket_name, xlfilename):
-    al = config.get('CONFIG', 'accessiblity_language')
-    options = config.options(al)
-    header = list(eval(config.get(al, options[0])))
-    filename = config.get(al, options[2])
-
-    rows = config.get(al, options[1])
-    rows = list(eval(rows))
-    rows_to_send = []
-    for row in rows:
-        language_class = []
-        language = []
-        if 'B' in row:
-            language.append('English in US/Spanish in PR')
-            language_class.append('Native')
-        elif 'F' in row:
-            language.append('Spanish in US/English in PR')
-            language_class.append('Non-native')
-        elif 'J' in row:
-            language.append('French')
-            language_class.append('Non-native')
-        elif 'N' in row:
-            language.append('Tagalog')
-            language_class.append('Non-native')
-        elif 'R' in row:
-            language.append('Vietnamese')
-            language_class.append('Non-native')
-        elif 'V' in row:
-            language.append('Mandarin')
-            language_class.append('Non-native')
-        elif 'Z' in row:
-            language.append('Cantonese')
-            language_class.append('Non-native')
-
-        for cell in row:
-            cell_ind = row.index(cell)
-            cell_value = dataframe.loc[index, cell]
-            if isinstance(cell_value, float) or isinstance(cell_value, int) == True:
-                row[cell_ind] = str(round((cell_value * 100), 2)) + '%'
-            else:
-                row[cell_ind] = cell_value
-        row = list(itertools.chain(language_class, language, row))
-        rows_to_send.append(row)
-    createCSVFile(header, filename, rows_to_send, file_details, bucket_name, xlfilename)
-    return len(rows_to_send)
-
-
-def createAccessiblityInterpreterCSV(dataframe, file_details, index, config, bucket_name, xlfilename):
-    ai = config.get('CONFIG', 'accessiblity_interpreter')
-    options = config.options(ai)
-    header = list(eval(config.get(ai, options[0])))
-    filename = config.get(ai, options[2])
-
-    rows = config.get(ai, options[1])
-    rows = list(eval(rows))
-    for cell in rows:
-        cell_ind = rows.index(cell)
-        cell_value = dataframe.loc[index, cell]
-        if isinstance(cell_value, float) or isinstance(cell_value, int) == True:
-            rows[cell_ind] = str(round((cell_value * 100), 2)) + '%'
-        else:
-            rows[cell_ind] = str(cell_value)
-    createCSVFile(header, filename, rows, file_details, bucket_name, xlfilename)
-    return len(rows)
-
-def createAccessiblityTTYCSV(dataframe, file_details, index, config, bucket_name, xlfilename):
-    atty = config.get('CONFIG', 'accessiblity_tty')
-    options = config.options(atty)
-    header = list(eval(config.get(atty, options[0])))
-    filename = config.get(atty, options[2])
-
-    rows = config.get(atty, options[1])
-    rows = list(eval(rows))
-    for cell in rows:
-        cell_ind = rows.index(cell)
-        cell_value = dataframe.loc[index, cell]
-        if isinstance(cell_value, float) or isinstance(cell_value, int) == True:
-            rows[cell_ind] = str(round((cell_value * 100), 2)) + '%'
-        else:
-            rows[cell_ind] = str(cell_value)
-    createCSVFile(header, filename, rows, file_details, bucket_name, xlfilename)
-    return len(rows)
-
-def createTimelinessCSV(dataframe, file_details, config, bucket_name, xlfilename):
-    tml = config.get('CONFIG', 'timeliness')
-    options = config.options(tml)
-    header = list(eval(config.get(tml, options[0])))
-    filename = config.get(tml, options[2])
-
-    rows = config.get(tml, options[1])
-    rows = list(eval(rows))
-    for row in rows:
-        for cell in row:
-            cell_ind = row.index(cell)
-            col, indx = cell[0:1], cell[1:2]
-            cell_value = dataframe.loc[int(indx), col]
-            if isinstance(cell_value, float):
-                row[cell_ind] = str(round(cell_value * 100, 2)) + '%'
-            else:
-                row[cell_ind] = str(cell_value)
-    createCSVFile(header, filename, rows, file_details, bucket_name, xlfilename)
-    return len(rows)
-
-
-def createAccuracyCSV(dataframe, file_details, index, config, bucket_name, xlfilename):
-    a = config.get('CONFIG', 'accessiblity_medicare_questions')
-    options = config.options(a)
-    header = list(eval(config.get(a, options[0])))
-    filename = config.get(a, options[2])
-
-    rows = config.get(a, options[1])
-    rows = list(eval(rows))
-    for cell in rows:
-        cell_ind = rows.index(cell)
-        cell_value = dataframe.loc[index, cell]
-        if isinstance(cell_value, float) or isinstance(cell_value, int) == True:
-            rows[cell_ind] = str(cell_value * 100) + '%'
-        else:
-            rows[cell_ind] = str(cell_value)
-    createCSVFile(header, filename, rows, file_details, bucket_name, xlfilename)
-    return len(rows)
-
-
-def createFileHeader(header, bucket_name, outdata_prefix, filename, s3_client):
-    csv_file_key = os.path.join(outdata_prefix, filename)
-    try:
-        # Check if the file already exists in S3. If it does, don't write the header.
-        s3_client.head_object(Bucket=bucket_name, Key=csv_file_key)
-        logging.info(
-            f"File {filename} already exists in s3://{bucket_name}/{csv_file_key}. Skipping header creation.")
-        return  # File exists, so skip creating the header
-    except Exception as e:
-        # The file does not exist, so create the header
-        csv_header = ','.join(header) + '\n'
-        try:
-            s3_client.put_object(Bucket=bucket_name, Key=csv_file_key, Body=csv_header.encode('utf-8'))
-            logging.info(f"Created header for {filename} in s3://{bucket_name}/{csv_file_key}")
-        except Exception as e:
-            logging.error(f"Error writing header to S3: {e}")
-            raise  # Re-raise to stop the job
-
-def createCSVFile(header, csv_filename, csv_rows, file_details, bucket_name, xlfilename):
-    """Appends the extracted data rows to the output CSV file, creates header if file doesn't exist."""
-    logging.info(f"Creating CSV for {csv_filename}")
-    global outdata_prefix
-    global s3_client
-    csv_file_key = os.path.join(outdata_prefix, csv_filename)
-    # Check if the header has been written
-    try:
-        s3_client.head_object(Bucket=bucket_name, Key=csv_file_key)
-        header_exists = True
-    except:
-        header_exists = False
-
-    # write header if it does not exist
-    if not header_exists:
-        createFileHeader(header, bucket_name, outdata_prefix, csv_filename, s3_client)
-
-    csv_rows_formatted = []
-
-    # Ensure file_details are strings
-    file_details = [str(detail) for detail in file_details]
-
-    # Format csv_rows based on its structure
-    if isinstance(csv_rows[0], str):
-        csv_rows_formatted.append(','.join(file_details + csv_rows) + '\n')
-        number_of_records = 1
-    else:
-        for row in csv_rows:
-            row = [str(item) for item in row]  # Convert each item in the row to a string
-            csv_rows_formatted.append(','.join(file_details + row) + '\n')
-        number_of_records = len(csv_rows)
-    csv_body = ''.join(csv_rows_formatted)
-    try:
-        s3_client.put_object(Bucket=bucket_name, Key=csv_file_key, Body=csv_body.encode('utf-8'))
-        logging.info(f"Wrote {number_of_records} records to s3://{bucket_name}/{csv_file_key}")
-    except Exception as e:
-        logging.error(f"Error writing to s3://{bucket_name}/{csv_file_key}: {e}")
-        raise
-    return number_of_records
-
-
-def process_zipfile(zip_file_key, zip_file_name, s3_client, bucket_name, config, outdata_prefix):
-    """Processes a ZIP file, extracting Excel files and converting them to CSV."""
-    total_records = 0
-    try:
-        # Download the ZIP file from S3 into memory
-        obj = s3_client.get_object(Bucket=bucket_name, Key=zip_file_key)
-        zip_file_content = io.BytesIO(obj['Body'].read())
-
-        with zipfile.ZipFile(zip_file_content, 'r') as zip_obj:
-            # Get a list of all files in the zip archive
-            file_list = zip_obj.namelist()
-            # Filter for Excel files
-            excel_files = [file for file in file_list if file.endswith('.xlsx') or file.endswith('.xls')]
-
-            # Check if there are any Excel files in the zip archive
-            if not excel_files:
-                logging.warning(f"No Excel files found in {zip_file_name}.")
-                return 0
-
-            # Process each Excel file
-            for excel_file in excel_files:
-                start = datetime.now()
-                logging.info(f"Processing Excel File:{excel_file} from zip {zip_file_name}")
-                report_time_period = zip_file_name[:-4][-17:]
-
-                # Read the Excel file content into memory
-                excel_file_content = io.BytesIO(zip_obj.read(excel_file))  # Get content as bytes
-                # Generate the checksum for the Excel file
-                checksum_data = zip_obj.read(excel_file)
-                checksum_value = hashlib.md5(checksum_data).hexdigest()
-                # Initialize CSV2TeradataLoad
-                ld = CSV2TeradataLoad()
-                # Check if the file has already been processed using the checksum
-                if ld.dupCheck(checksum_value):
-                    number_of_records = convertPartDReportToDF(excel_file_content, excel_file, report_time_period,
-                                                                bucket_name, config)
-                    total_records += number_of_records
-                    logging.info(
-                        f"Processed Excel file {excel_file} from zip {zip_file_name}. Number of records: {number_of_records}")
-                    # Insert audit record upon successful processing
-                    file_details = {
-                        'file_name': excel_file,
-                        'file_size': obj['ContentLength'],
-                        'record_count': number_of_records,
-                        'status': 'success',
-                        'checksum': checksum_value,
-                        'source': 'Inbound_Call_Center_Monitoring'
-                    }
-                    ld.insert_audit_table(file_details)
-                else:
-                    logging.info(f"File {excel_file} has already been processed. Skipping.")
-        archive_zipfile(s3_client, bucket_name, archive_prefix, zip_file_key, zip_file_name)
-    except Exception as e:
-        logging.error(f"Error processing ZIP file {zip_file_name}: {e}")
-
-    return total_records
-
-def archive_zipfile(s3_client, bucket_name, archive_prefix, zip_file_key, zip_file_name):
-    """Archives the processed ZIP file to the archive folder."""
-    try:
-        # Build the destination S3 key in the archive folder
-        archive_file_key = os.path.join(archive_prefix, zip_file_name)
-
-        # Copy the zip file from the input folder to the archive folder
-        copy_source = {
-            'Bucket': bucket_name,
-            'Key': zip_file_key
-        }
-        s3_client.copy(copy_source, bucket_name, archive_file_key)
-
-        # Delete the original file from the input folder
-        s3_client.delete_object(Bucket=bucket_name, Key=zip_file_key)
-
-        logging.info(
-            f"Successfully archived {zip_file_name} from s3://{bucket_name}/{zip_file_key} to s3://{bucket_name}/{archive_file_key}")
-    except Exception as e:
-        logging.error(f"Error archiving {zip_file_name}: {e}")
-        raise
-
-
-def runMain(s3_client, bucket_name, config_prefix_key, outdata_prefix, archive_prefix,
-            indata_prefix):
-    """Main execution function to process ZIP files in the specified input folder."""
-    total_records = 0
-    total_files = 0
-    processed_files = []
-
-    try:
-        # Load the configuration
-        config = load_config(s3_client, bucket_name, config_prefix_key)
-
-        # List all objects in the input folder with a .zip extension
-        objects = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=indata_prefix)
-
-        if 'Contents' not in objects:
-            logging.warning(f"No files found in s3://{bucket_name}/{indata_prefix}")
-            return
-
-        for obj in objects['Contents']:
-            file_key = obj['Key']
-            if file_key.endswith('.zip'):
-                logging.info(f"Processing zip file: s3://{bucket_name}/{file_key}")
-                zip_file_name = os.path.basename(file_key)  # Extract filename
-                number_of_records = process_zipfile(file_key, zip_file_name, s3_client, bucket_name, config,
-                                                     outdata_prefix)
-
-                if number_of_records > 0:
-                    processed_files.append(zip_file_name)
-                    total_records += number_of_records
-                    total_files += 1
-                else:
-                    logging.warning(f"No records processed from {zip_file_name}.")
-            else:
-                logging.info(f"Skipping non-zip file: s3://{bucket_name}/{file_key}")
-
-        logging.info(f"Total files processed: {total_files}")
-        logging.info(f"Total records processed: {total_records}")
-        logging.info(f"Processed files: {processed_files}")
-
-    except Exception as e:
-        logging.error(f"Job failed: {e}")
-        raise
-
-# AWS Glue job code
-if __name__ == "__main__":
-    from awsglue.utils import getResolvedOptions
-    from awsglue.context import GlueContext
-    from awsglue.job import Job
-    from pyspark import SparkContext
-
-    # Initialize Spark and Glue contexts
-    sc = SparkContext()
-    glueContext = GlueContext(sc)
-    spark = glueContext.spark_session
-
-    # Resolve job parameters
-    args = getResolvedOptions(sys.argv,
-                              ['JOB_NAME',
-                               'bucket_name',
-                               'config_prefix_key',
-                               'outdata_prefix',
-                               'archive_prefix',
-                               'indata_prefix'])  # Added prefixes
-
-    # Initialize job
-    job = Job(glueContext)
-    job.init(args['JOB_NAME'], args)
-
-    # Configure logging
-    logging.basicConfig(level=logging.INFO,
-                        format='%(levelname)s:%(asctime)s::%(message)s',
-                        datefmt='%m/%d/%Y %I:%M:%S %p')
-
-    # Define variables for bucket and folder paths
-    bucket_name = args['bucket_name']
-    config_prefix_key = args['config_prefix_key']
-    outdata_prefix = args['outdata_prefix']
-    archive_prefix = args['archive_prefix']
-    indata_prefix = args['indata_prefix']
-
-    # Create S3 client
-    s3_client = boto3.client('s3')
-
-    # Make them global
-    globals()['s3_client'] = s3_client
-    globals()['outdata_prefix'] = outdata_prefix
-
-    # Run the main process
-    runMain(s3_client, bucket_name, config_prefix_key, outdata_prefix, archive_prefix,
-            indata_prefix)
-
-    # Commit job
-    job.commit()
 
                 </ul>
             </div>
@@ -715,6 +234,38 @@ if __name__ == "__main__":
     <section id="about-me" >
       <h2 class="section-title">About Me</h2><br>
       <p class="aboutme">After completing my intermediate education, I found myself unsure about my career path. Through extensive research, I discovered the vast potential of the technology field, which inspired me to pursue a degree in IT. During my time in the IT branch, I gained valuable knowledge and skills in various technology areas. As I progressed, my curiosity led me to explore the field of data science, prompting me to delve deeper through thorough research. Motivated by the endless possibilities it offers, I enthusiastically dedicated myself to learning and mastering data science technologies. This journey has allowed me to expand my expertise and lay a solid foundation for a successful career in the technical field.</p>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scroll Bar Example</title>
+    <style>
+        .scrollable-container {
+            width: 100%;
+            height: 200px;
+            overflow: scroll; /* This adds the scroll bar */
+            border: 2px solid #ccc; /* Optional, for styling */
+        }
+        .content {
+            height: 500px; /* Content height greater than container height to show scrolling */
+            background-color: #f0f0f0; /* Just a background color for content */
+        }
+    </style>
+</head>
+<body>
+
+<div class="scrollable-container">
+    <div class="content">
+        <h3>Scrollable Content</h3>
+        <p>This is an example of content that exceeds the container's height, causing the scroll bar to appear.</p>
+        <p>More content...</p>
+        <p>Keep scrolling to see more.</p>
+    </div>
+</div>
+
+</body>
+</html>
 
     </section>
 
@@ -734,6 +285,7 @@ if __name__ == "__main__":
             <p>  <br><br><br>
                 </p>
           </div>
+          
         </div>
 
         
